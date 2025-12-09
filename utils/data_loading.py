@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from functools import lru_cache
 from functools import partial
@@ -22,6 +23,17 @@ def load_image(filename):
     else:
         return Image.open(filename)
 
+def load_multi_channel_image(filename):
+    """
+    Loads multi channel image data from .pt file
+    
+    Tensor is assumed to be (H, W, CHANNELS)
+    """
+    ext = splitext(filename)[1]
+    if ext == '.pt' or ext == '.pth':
+        return torch.load(filename, map_location='cpu')
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}. Expected '.pt' or '.pth'.")
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.*'))[0]
@@ -89,6 +101,17 @@ class BasicDataset(Dataset):
                 img = img / 255.0
 
             return img
+    
+    @staticmethod
+    def preprocess_multi_channel_image(tensor_image, scale):
+        """
+        Preprocessing transforms from       (H, W, CHANNELS) to (CHANNELS, H, W)
+        Additionally, scales the input from (CHANNELS, H, W) to (CHANNELS, H * SCALE, W * SCALE)
+
+        """
+        img_tensor = tensor_image.transpose(0, 2).transpose(1, 2)
+        img_tensor = F.interpolate(img_tensor.unsqueeze(0), scale_factor=scale, mode='bicubic', align_corners=False).squeeze(0)
+        return img_tensor
 
     def __getitem__(self, idx):
         name = self.ids[idx]
@@ -98,16 +121,22 @@ class BasicDataset(Dataset):
         assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'
         assert len(mask_file) == 1, f'Either no mask or multiple masks found for the ID {name}: {mask_file}'
         mask = load_image(mask_file[0])
-        img = load_image(img_file[0])
+        img = load_multi_channel_image(img_file[0])
+        
+        # Get width and height from the PIL mask
+        mask_w, mask_h = mask.size
+        # Get width and height from the tensor's shape (H, W, C)
+        img_h, img_w, _ = img.shape
 
-        assert img.size == mask.size, \
-            f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
+        assert img_h == mask_h and img_w == mask_w, \
+            f'Image and mask {name} should be the same size. ' \
+            f'Image size (H, W): ({img_h}, {img_w}), Mask size (H, W): ({mask_h}, {mask_w})'
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
+        img = self.preprocess_multi_channel_image(img, self.scale)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
 
         return {
-            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'image': img.float().contiguous(),
             'mask': torch.as_tensor(mask.copy()).long().contiguous()
         }
 
