@@ -78,7 +78,8 @@ def train_model(
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    # criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    bce_loss = nn.BCEWithLogitsLoss(reduction='none')
     global_step = 0
 
     # 5. Begin training
@@ -87,7 +88,7 @@ def train_model(
         epoch_loss = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+                images, true_masks, valid_masks = batch['image'], batch['mask'], batch['valid_mask']
 
                 assert images.shape[1] == model.n_channels, \
                     f'Network has been defined with {model.n_channels} input channels, ' \
@@ -95,20 +96,34 @@ def train_model(
                     'the images are loaded correctly.'
 
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
+                valid_masks = valid_masks.to(device=device, dtype=torch.float32)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+
+                    # if model.n_classes == 1:
+
+                    masks_pred = masks_pred.squeeze(1)    
+                    
+                    # mask out nan regions
+                    masks_pred = masks_pred * valid_masks
+                    true_masks = true_masks * valid_masks
+
+                    loss = bce_loss(masks_pred, true_masks.float())
+                    loss = loss * valid_masks
+                    loss = loss.mean() # reduce after masking
+
+                    # still a scalar but masking adds 0 to both numerator and denominator
+                    loss += dice_loss(F.sigmoid(masks_pred), true_masks.float(), multiclass=False)
+
+                    # else:
+                    #     loss = criterion(masks_pred, true_masks)
+                    #     loss += dice_loss(
+                    #         F.softmax(masks_pred, dim=1).float(),
+                    #         F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                    #         multiclass=True
+                    #     )
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -174,12 +189,13 @@ def get_args():
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
+    parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
+    parser.add_argument('--dim', '-d', dest='dim', type=int, default=3, help='Dimension of the input')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
 
     return parser.parse_args()
 
@@ -194,7 +210,7 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=6, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=args.dim, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'

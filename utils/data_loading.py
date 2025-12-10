@@ -31,7 +31,11 @@ def load_multi_channel_image(filename):
     """
     ext = splitext(filename)[1]
     if ext == '.pt' or ext == '.pth':
-        return torch.load(filename, map_location='cpu')
+        img = torch.load(filename, map_location='cpu')
+        # img = img[:, :, [6, 7, 8, 11, 12] + list(range(15, img.shape[2]))]
+        # img = img[:, :, [6, 7, 8, 11, 12, 15, 17, 18, 19]]
+        # img = img[:, :, [6, 7, 8, 11, 12]]
+        return img
     else:
         raise ValueError(f"Unsupported file extension: {ext}. Expected '.pt' or '.pth'.")
 
@@ -135,9 +139,14 @@ class BasicDataset(Dataset):
         img = self.preprocess_multi_channel_image(img, self.scale)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
 
+        nan_mask = torch.isnan(img)
+        img[nan_mask] = 0.0
+        nan_mask = nan_mask.any(dim=0)
+
         return {
             'image': img.float().contiguous(),
-            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+            'mask': torch.as_tensor(mask.copy()).long().contiguous(),
+            'valid_mask': nan_mask.logical_not().contiguous()
         }
 
 
